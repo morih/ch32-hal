@@ -127,6 +127,9 @@ pub mod usbd;
 #[cfg(usbhs_v3)]
 pub mod usbhs;
 
+#[cfg(usb_x0fs)]
+pub mod usbfs;
+
 #[cfg(usbpd)]
 pub mod usbpd;
 
