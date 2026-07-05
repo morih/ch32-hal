@@ -74,6 +74,9 @@ defmt = ["dep:defmt"]
 memory-x = ["ch32-metapac/memory-x"]
 ## Built-in EXTI driver and interrupt handlers. Disable to provide your own.
 exti = []
+## Enable EP5/EP6/EP7 on the CH32X035 `usbfs` driver (adds ~300 bytes of static RAM usage
+## even if those endpoints are never allocated; off by default so plain CDC/HID users don't pay for it).
+usbfs-ep567 = []
 
 
 # Features starting with `_` are for internal use only. They're not intended

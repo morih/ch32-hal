@@ -9,6 +9,11 @@
 //! 同じエンドポイント番号をIN/OUT両方向で同時には使えない。CDC-ACMのように
 //! データ用エンドポイントがちょうど3本(通知IN・バルクOUT・バルクIN)で足りるクラスなら
 //! これで十分。EP4はハードウェア上EP0とDMAバッファを共有しているため、今のところ未対応。
+//!
+//! `usbfs-ep567` フィーチャーを有効にすると、独立したバッファを持つEP5〜EP7も追加で
+//! 使えるようになる(CDC+HIDの複合デバイスなど、4本目以降のデータ用エンドポイントが
+//! 必要な場合向け)。デフォルトでは無効: 有効にすると使わなくても静的バッファ・Waker配列の
+//! 分だけRAMを常時消費するため、CDC単体などで足りる用途では無効のままにしておくとよい。
 
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
@@ -28,8 +33,15 @@ use crate::pac::usb::regs::UepDma;
 use crate::peripheral::RccPeripheral;
 use crate::{interrupt, pac, Peri, PeripheralType};
 
-/// このドライバが実装するハードウェアエンドポイント数: EP0(コントロール) + EP1〜EP3。
+/// このドライバが実装するハードウェアエンドポイント数。
+///
+/// `usbfs-ep567` フィーチャー無効時: EP0(コントロール) + EP1〜EP3 の4本。
+/// 有効時: それに加えてEP5〜EP7も使えるようにするため8本ぶんの領域を確保する
+/// (インデックス4=EP4はEP0とバッファ共有のため常に未使用のまま)。
+#[cfg(not(feature = "usbfs-ep567"))]
 const EP_COUNT: usize = 4;
+#[cfg(feature = "usbfs-ep567")]
+const EP_COUNT: usize = 8;
 /// Full-Speedでの最大パケットサイズ(バイト数)。
 const MAX_PACKET_SIZE: u16 = 64;
 
@@ -60,6 +72,15 @@ static EP_BUF_1: AlignedBuf<64> = AlignedBuf::new();
 static EP_BUF_2: AlignedBuf<64> = AlignedBuf::new();
 static EP_BUF_3: AlignedBuf<64> = AlignedBuf::new();
 
+// EP5〜EP7用の追加バッファ。`usbfs-ep567` フィーチャー有効時のみ確保する
+// (無効時はこの分のRAMを一切消費しない)。
+#[cfg(feature = "usbfs-ep567")]
+static EP_BUF_5: AlignedBuf<64> = AlignedBuf::new();
+#[cfg(feature = "usbfs-ep567")]
+static EP_BUF_6: AlignedBuf<64> = AlignedBuf::new();
+#[cfg(feature = "usbfs-ep567")]
+static EP_BUF_7: AlignedBuf<64> = AlignedBuf::new();
+
 /// エンドポイント番号からそのDMAバッファの先頭ポインタを返す。
 fn ep_buf_ptr(index: usize) -> *mut u8 {
     match index {
@@ -67,21 +88,109 @@ fn ep_buf_ptr(index: usize) -> *mut u8 {
         1 => EP_BUF_1.as_ptr(),
         2 => EP_BUF_2.as_ptr(),
         3 => EP_BUF_3.as_ptr(),
+        #[cfg(feature = "usbfs-ep567")]
+        5 => EP_BUF_5.as_ptr(),
+        #[cfg(feature = "usbfs-ep567")]
+        6 => EP_BUF_6.as_ptr(),
+        #[cfg(feature = "usbfs-ep567")]
+        7 => EP_BUF_7.as_ptr(),
         _ => unreachable!(),
     }
 }
 
-/// EP1〜EP3は2つのモードレジスタ(UEP4_1_MOD, UEP2_3_MOD)を共有していて、
-/// それぞれのレジスタが2エンドポイント分のTX_EN/RX_ENビットを4bitずつ詰めて持っている。
-/// (実機のレジスタ定義から逆算した対応関係: UEP4_1_MODのn=0はEP4、n=1はEP1。
-///  UEP2_3_MODのn=0はEP2、n=1はEP3。EP4は今のところ使わないのでここには出てこない。)
+/// 指定エンドポイントの`UEPn_CTRL`レジスタを返す。
 ///
-/// 戻り値は `(UEP4_1_MODを使うか, そのレジスタ内でのサブインデックス)`。
-fn ep_mode_slot(index: usize) -> (bool, usize) {
+/// EP0〜EP4は`UEP01234_CTRL(n)`(nはエンドポイント番号そのもの)、EP5〜EP7は
+/// 別グループの`UEP567_CTRL(n)`(nは`index - 5`)という、ハードウェア側の2グループ構成を
+/// ここで吸収し、呼び出し側は番号を意識せずに扱えるようにする。
+fn ep_ctrl(usb: pac::usb::Usbd, index: usize) -> pac::common::Reg<pac::usb::regs::UepCtrl, pac::common::RW> {
+    #[cfg(feature = "usbfs-ep567")]
+    if index >= 5 {
+        return usb.uep567_ctrl(index - 5);
+    }
+    usb.uep01234_ctrl(index)
+}
+
+/// 指定エンドポイントの`UEPn_T_LEN`(送信長)レジスタを返す。`ep_ctrl`と同じ理由で分岐する。
+fn ep_t_len(usb: pac::usb::Usbd, index: usize) -> pac::common::Reg<pac::usb::regs::UepTLen, pac::common::RW> {
+    #[cfg(feature = "usbfs-ep567")]
+    if index >= 5 {
+        return usb.uep567_t_len(index - 5);
+    }
+    usb.uep01234_t_len(index)
+}
+
+/// 指定エンドポイントのDMAアドレスレジスタを返す。EP0〜EP3は`UEP0123_DMA(n)`
+/// (EP4はEP0と同じ`n=0`を共有するためここには出てこない)、EP5〜EP7は
+/// `UEP567_DMA(n)`(n=index-5)を使う。
+fn ep_dma(usb: pac::usb::Usbd, index: usize) -> pac::common::Reg<pac::usb::regs::UepDma, pac::common::RW> {
+    #[cfg(feature = "usbfs-ep567")]
+    if index >= 5 {
+        return usb.uep567_dma(index - 5);
+    }
+    usb.uep0123_dma(index)
+}
+
+/// 指定エンドポイントのTX_EN/RX_ENビットを、そのエンドポイントが実際に属する
+/// モードレジスタ(`UEP4_1_MOD`/`UEP2_3_MOD`/`UEP567_MOD`)に対して立てる。
+///
+/// EP1〜EP3は2つのレジスタ(UEP4_1_MOD, UEP2_3_MOD)を共有していて、それぞれ
+/// 2エンドポイント分のビットを4bitずつ詰めて持っている(実機のレジスタ定義から
+/// 逆算した対応関係: UEP4_1_MODのn=0はEP4・n=1はEP1、UEP2_3_MODのn=0はEP2・n=1はEP3)。
+/// EP5〜EP7はUEP567_MODという別レジスタで、n=0,1,2がそれぞれEP5,6,7に対応する。
+fn enable_ep_mode(usb: pac::usb::Usbd, index: usize, used_in: bool, used_out: bool) {
     match index {
-        1 => (true, 1),
-        2 => (false, 0),
-        3 => (false, 1),
+        1 => usb.uep4_1_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(1, true);
+            }
+            if used_out {
+                w.set_rx_en(1, true);
+            }
+        }),
+        2 => usb.uep2_3_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(0, true);
+            }
+            if used_out {
+                w.set_rx_en(0, true);
+            }
+        }),
+        3 => usb.uep2_3_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(1, true);
+            }
+            if used_out {
+                w.set_rx_en(1, true);
+            }
+        }),
+        #[cfg(feature = "usbfs-ep567")]
+        5 => usb.uep567_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(0, true);
+            }
+            if used_out {
+                w.set_rx_en(0, true);
+            }
+        }),
+        #[cfg(feature = "usbfs-ep567")]
+        6 => usb.uep567_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(1, true);
+            }
+            if used_out {
+                w.set_rx_en(1, true);
+            }
+        }),
+        #[cfg(feature = "usbfs-ep567")]
+        7 => usb.uep567_mod().modify(|w| {
+            if used_in {
+                w.set_tx_en(2, true);
+            }
+            if used_out {
+                w.set_rx_en(2, true);
+            }
+        }),
         _ => unreachable!(),
     }
 }
@@ -202,7 +311,7 @@ fn handle_setup(usb: pac::usb::Usbd) {
 /// 次回の送信に備えてデータトグルを反転し、応答をNAKに戻す(次のデータが
 /// `write()`側から積まれるまでホストを待たせる)。
 fn handle_in(usb: pac::usb::Usbd, index: usize) {
-    usb.uep01234_ctrl(index).modify(|w| {
+    ep_ctrl(usb, index).modify(|w| {
         let tog = !w.t_tog();
         w.set_t_tog(tog);
         w.set_t_res(RES_NAK);
@@ -217,7 +326,7 @@ fn handle_in(usb: pac::usb::Usbd, index: usize) {
 fn handle_out(usb: pac::usb::Usbd, index: usize) {
     let rx_len = usb.rx_len().read().rx_len();
     EP_OUT_LEN[index].store(rx_len, Ordering::Relaxed);
-    usb.uep01234_ctrl(index).modify(|w| {
+    ep_ctrl(usb, index).modify(|w| {
         let tog = !w.r_tog();
         w.set_r_tog(tog);
         w.set_r_res(RES_NAK);
@@ -301,11 +410,17 @@ impl<'d, T: Instance> Driver<'d, T> {
 
     /// 指定したエンドポイント番号がまだ未使用かどうか。
     ///
-    /// EP0(インデックス0)はコントロール用に予約済みなので対象外。EP1〜EP3は
-    /// 「1エンドポイントにつきDMAバッファ1つ」という制約上、IN/OUTどちらか片方でも
-    /// 使われていたらもう割り当てられない(usb/mod.rs冒頭のコメント参照)。
+    /// EP0(インデックス0)はコントロール用に予約済み、EP4(インデックス4)はEP0との
+    /// バッファ共有を実装していないため、どちらも対象外。それ以外(EP1〜EP3、
+    /// `usbfs-ep567`有効時はEP5〜EP7も)は「1エンドポイントにつきDMAバッファ1つ」
+    /// という制約上、IN/OUTどちらか片方でも使われていたらもう割り当てられない
+    /// (モジュール冒頭のコメント参照)。
     fn is_endpoint_available(&self, index: usize) -> bool {
-        index >= 1 && index < EP_COUNT && !self.alloc[index].used_in && !self.alloc[index].used_out
+        index >= 1
+            && index != 4
+            && index < EP_COUNT
+            && !self.alloc[index].used_in
+            && !self.alloc[index].used_out
     }
 
     /// EP1〜EP3の中から空いている番号を探して割り当てる。IN/OUT共通の実装。
@@ -383,38 +498,22 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
         let usb = T::regs();
 
         for index in 1..EP_COUNT {
+            if index == 4 {
+                continue; // EP4はEP0とのバッファ共有を実装していないため常にスキップする
+            }
+
             let ep = &self.alloc[index];
             if !ep.used_in && !ep.used_out {
                 continue;
             }
 
-            usb.uep0123_dma(index).write_value(UepDma(ep_buf_ptr(index) as u32));
-            usb.uep01234_ctrl(index).write(|w| {
+            ep_dma(usb, index).write_value(UepDma(ep_buf_ptr(index) as u32));
+            ep_ctrl(usb, index).write(|w| {
                 w.set_t_res(RES_NAK);
                 w.set_r_res(RES_NAK);
             });
 
-            // ep_mode_slotで求めたレジスタ/ビット位置に対応するTX_EN/RX_ENだけを立てる。
-            let (uep4_1, n) = ep_mode_slot(index);
-            if uep4_1 {
-                usb.uep4_1_mod().modify(|w| {
-                    if ep.used_in {
-                        w.set_tx_en(n, true);
-                    }
-                    if ep.used_out {
-                        w.set_rx_en(n, true);
-                    }
-                });
-            } else {
-                usb.uep2_3_mod().modify(|w| {
-                    if ep.used_in {
-                        w.set_tx_en(n, true);
-                    }
-                    if ep.used_out {
-                        w.set_rx_en(n, true);
-                    }
-                });
-            }
+            enable_ep_mode(usb, index, ep.used_in, ep.used_out);
         }
 
         usb.uep0123_dma(0).write_value(UepDma(ep_buf_ptr(0) as u32));
@@ -473,7 +572,10 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                     w.set_t_res(RES_NAK);
                 });
                 for index in 1..EP_COUNT {
-                    usb.uep01234_ctrl(index).write(|w| {
+                    if index == 4 {
+                        continue;
+                    }
+                    ep_ctrl(usb, index).write(|w| {
                         w.set_t_res(RES_NAK);
                         w.set_r_res(RES_NAK);
                     });
@@ -513,13 +615,11 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
         let index = ep_addr.index();
         match ep_addr.direction() {
             Direction::In => {
-                usb.uep01234_ctrl(index)
-                    .modify(|w| w.set_t_res(if enabled { RES_NAK } else { RES_STALL }));
+                ep_ctrl(usb, index).modify(|w| w.set_t_res(if enabled { RES_NAK } else { RES_STALL }));
                 EP_IN_WAKERS[index].wake();
             }
             Direction::Out => {
-                usb.uep01234_ctrl(index)
-                    .modify(|w| w.set_r_res(if enabled { RES_ACK } else { RES_STALL }));
+                ep_ctrl(usb, index).modify(|w| w.set_r_res(if enabled { RES_ACK } else { RES_STALL }));
                 EP_OUT_WAKERS[index].wake();
             }
         }
@@ -530,13 +630,11 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
         let index = ep_addr.index();
         match ep_addr.direction() {
             Direction::In => {
-                usb.uep01234_ctrl(index)
-                    .modify(|w| w.set_t_res(if stalled { RES_STALL } else { RES_NAK }));
+                ep_ctrl(usb, index).modify(|w| w.set_t_res(if stalled { RES_STALL } else { RES_NAK }));
                 EP_IN_WAKERS[index].wake();
             }
             Direction::Out => {
-                usb.uep01234_ctrl(index)
-                    .modify(|w| w.set_r_res(if stalled { RES_STALL } else { RES_ACK }));
+                ep_ctrl(usb, index).modify(|w| w.set_r_res(if stalled { RES_STALL } else { RES_ACK }));
                 EP_OUT_WAKERS[index].wake();
             }
         }
@@ -544,7 +642,7 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
 
     fn endpoint_is_stalled(&mut self, ep_addr: EndpointAddress) -> bool {
         let usb = T::regs();
-        let ctrl = usb.uep01234_ctrl(ep_addr.index()).read();
+        let ctrl = ep_ctrl(usb, ep_addr.index()).read();
         match ep_addr.direction() {
             Direction::In => ctrl.t_res() == RES_STALL,
             Direction::Out => ctrl.r_res() == RES_STALL,
@@ -580,7 +678,7 @@ impl Dir for Out {
     }
 }
 
-/// USBエンドポイント(コントロール以外、EP1〜EP3のいずれか)。
+/// USBエンドポイント(コントロール以外、EP1〜EP3のいずれか。`usbfs-ep567`有効時はEP5〜EP7も)。
 pub struct Endpoint<'d, T: Instance, D> {
     _phantom: PhantomData<(&'d mut T, D)>,
     info: EndpointInfo,
@@ -602,7 +700,7 @@ impl<'d, T: Instance, D> driver::Endpoint for Endpoint<'d, T, D> {
                 Direction::Out => EP_OUT_WAKERS[index].register(cx.waker()),
             }
             let usb = T::regs();
-            let ctrl = usb.uep01234_ctrl(index).read();
+            let ctrl = ep_ctrl(usb, index).read();
             let disabled = match dir {
                 Direction::In => ctrl.t_res() == RES_STALL,
                 Direction::Out => ctrl.r_res() == RES_STALL,
@@ -627,7 +725,7 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
         let stat = poll_fn(|cx| {
             EP_OUT_WAKERS[index].register(cx.waker());
             let usb = T::regs();
-            let ctrl = usb.uep01234_ctrl(index).read();
+            let ctrl = ep_ctrl(usb, index).read();
             match ctrl.r_res() {
                 RES_NAK => Poll::Ready(RES_NAK),
                 RES_STALL => Poll::Ready(RES_STALL),
@@ -648,7 +746,7 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
 
         // 読み出しが終わったので次のOUTパケットを受け付けられるようにACKへ戻す。
         let usb = T::regs();
-        usb.uep01234_ctrl(index).modify(|w| w.set_r_res(RES_ACK));
+        ep_ctrl(usb, index).modify(|w| w.set_r_res(RES_ACK));
 
         Ok(rx_len)
     }
@@ -667,7 +765,7 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
         let stat = poll_fn(|cx| {
             EP_IN_WAKERS[index].register(cx.waker());
             let usb = T::regs();
-            let ctrl = usb.uep01234_ctrl(index).read();
+            let ctrl = ep_ctrl(usb, index).read();
             match ctrl.t_res() {
                 RES_NAK => Poll::Ready(RES_NAK),
                 RES_STALL => Poll::Ready(RES_STALL),
@@ -683,8 +781,8 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
         self.buf.write(buf);
 
         let usb = T::regs();
-        usb.uep01234_t_len(index).write(|w| w.set_t_len(buf.len() as u8));
-        usb.uep01234_ctrl(index).modify(|w| w.set_t_res(RES_ACK));
+        ep_t_len(usb, index).write(|w| w.set_t_len(buf.len() as u8));
+        ep_ctrl(usb, index).modify(|w| w.set_t_res(RES_ACK));
 
         Ok(())
     }
