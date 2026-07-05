@@ -11,7 +11,7 @@ use embassy_executor::Spawner;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
-use hal::usbfs::{Driver, Instance};
+use hal::usbfs::{Driver, Instance, UsbVoltage};
 use hal::{bind_interrupts, peripherals};
 use panic_halt as _;
 
@@ -30,7 +30,9 @@ async fn main(_spawner: Spawner) {
     });
 
     // D+/D-ピンはハードウェア固定でPC17/PC16のみが使える。
-    let driver = Driver::new(p.USBFS, Irqs, p.PC17, p.PC16);
+    // このボードはVDD≈3.3Vで動作しているので UsbVoltage::V33 を指定する
+    // (VDD≈5Vの基板であれば UsbVoltage::V5 に変更すること)。
+    let driver = Driver::new(p.USBFS, Irqs, p.PC17, p.PC16, UsbVoltage::V33);
 
     let mut config = embassy_usb::Config::new(0x1a86, 0xfe0c);
     config.manufacturer = Some("ch32-rs");

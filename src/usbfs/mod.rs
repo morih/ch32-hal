@@ -342,6 +342,19 @@ struct EndpointData {
     used_out: bool,
 }
 
+/// ボードのVDD電圧に応じたUSB PHYの動作モード。
+///
+/// D+のプルアップ抵抗値とPHYの耐圧設定は、VDDが3.3Vか5Vかで正しい組み合わせが変わる
+/// (リファレンスマニュアルのAFIO_CTLRレジスタ、UDP_PUE/USB_PHY_V33の説明を参照)。
+/// この2つは必ずセットで切り替える必要があるため、個別のビットではなくこのenumで渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbVoltage {
+    /// VDD ≈ 3.3V。D+に1.5kΩのプルアップ、PHYは3.3Vフル振幅モード。
+    V33,
+    /// VDD ≈ 5V。D+に10kΩのプルアップ、PHYは5Vトレラントモード。
+    V5,
+}
+
 /// USBドライバ本体。`embassy_usb_driver::Driver` を実装する。
 pub struct Driver<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
@@ -352,12 +365,14 @@ impl<'d, T: Instance> Driver<'d, T> {
     /// 新しいUSBドライバを作成し、ハードウェアを初期化する。
     ///
     /// `dp`/`dm` はチップ固定でそれぞれ PC17/PC16 のみが対応する(`DpPin`/`DmPin` の
-    /// 実装がこの2ピンにしか付いていない)。
+    /// 実装がこの2ピンにしか付いていない)。`vdd` は基板の実際のVDD電圧に合わせて指定する
+    /// (`UsbVoltage`のドキュメント参照)。
     pub fn new(
         _usb: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         dp: Peri<'d, impl DpPin<T>>,
         dm: Peri<'d, impl DmPin<T>>,
+        vdd: UsbVoltage,
     ) -> Self {
         // D+/D- はフローティング入力のままにしておく: この後AFIOのUSB_IOENを立てると、
         // 以降はGPIOブロックではなくUSB PHYがこの2ピンを直接駆動するようになる。
@@ -370,8 +385,16 @@ impl<'d, T: Instance> Driver<'d, T> {
 
         pac::AFIO.ctlr().modify(|w| {
             w.set_udm_pue(0b00);
-            w.set_udp_pue(0b11); // D+に1.5kΩプルアップ: Full-Speedデバイスとしてホストに認識させる
-            w.set_usb_phy_v33(true); // 3.3V PHY
+            match vdd {
+                UsbVoltage::V33 => {
+                    w.set_udp_pue(0b11); // D+に1.5kΩプルアップ(3.3V用)
+                    w.set_usb_phy_v33(true); // 3.3Vフル振幅PHY
+                }
+                UsbVoltage::V5 => {
+                    w.set_udp_pue(0b10); // D+に10kΩプルアップ(5V用)
+                    w.set_usb_phy_v33(false); // 5Vトレラントモード
+                }
+            }
             w.set_usb_ioen(true); // D+/DMピンをGPIOからUSB PHYへ切り替える
         });
 
