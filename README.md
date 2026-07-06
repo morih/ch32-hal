@@ -1,5 +1,10 @@
 # ch32-hal
 
+
+# CH32X033/CH32X035 USBFS
+
+Suport USBFS device on CH32X033/CH32X035 chips. The USBFS device driver is implemented in the `usbfs` module, which provides a high-level API for USB device functionality.
+
 [![Demo Code Github Actions][badge-actions]][actions-build]
 
 [badge-actions]: https://img.shields.io/github/actions/workflow/status/ch32-rs/ch32-hal/build.yml?style=for-the-badge&label=Demo%20Code%20Build
@@ -14,7 +19,7 @@ Rust HAL(Hardware Abstraction Layer) crate for WCH's 32-bit RISC-V microcontroll
 
 This HAL crates is the [Embassy](https://github.com/embassy-rs/embassy) framework driver for WCH's 32-bit RISC-V microcontrollers.
 
-This HAL crates uses the metapac approach to support multiple chips in the same crate.
+This HAL crates uses the metapac approach to support multiple chips in the same crate.pport
 The metapac is maintained in the [ch32-rs/ch32-data](https://github.com/ch32-rs/ch32-data) repository, published as a crate `ch32-metapac`.
 
 Keypoints:
@@ -46,6 +51,7 @@ For a full list of chip capabilities and peripherals, check the [ch32-data](http
 | USBD       | ✅\*  | N/A | N/A  | N/A  | N/A  | N/A  | N/A   | N/A   |
 | USB/OTG FS | ✅\*  | N/A | N/A  | N/A  | N/A  | N/A  | N/A   | N/A   |
 | USB HS     | ✅\*  | N/A | N/A  | N/A  | N/A  | N/A  | N/A   | N/A   |
+| USB FS     | N/A   | N/A | N/A  | N/A  | ✅\*  | N/A  | N/A   | N/A   |
 | USB PD     | N/A   | N/A | N/A  | N/A  | ✅\* | ✅\* | ❓    | ❓    |
 | ETH\*      | ✅†   | N/A | N/A  | N/A  | N/A  | N/A  | N/A   | N/A   |
 | CAN\*      | ✅    | N/A | N/A  | N/A  | N/A  | ✅   | N/A   | N/A   |
