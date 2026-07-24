@@ -1,9 +1,10 @@
+## CH32X033/CH32X035 USBFS
+
+Suport USBFS device on CH32X033/CH32X035 chips. The USBFS device driver is implemented in the `usbfs` module, which provides a high-level API for USB device functionality.
+
 # ch32-hal
 
 
-# CH32X033/CH32X035 USBFS
-
-Suport USBFS device on CH32X033/CH32X035 chips. The USBFS device driver is implemented in the `usbfs` module, which provides a high-level API for USB device functionality.
 
 [![Demo Code Github Actions][badge-actions]][actions-build]
 
